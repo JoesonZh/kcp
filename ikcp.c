@@ -530,7 +530,7 @@ int ikcp_send(ikcpcb *kcp, const char *buffer, int len)
 			memcpy(seg->data, buffer, size);
 		}
 		seg->len = size;
-		seg->frg = (kcp->stream == 0)? (count - i - 1) : 0;     // frg倒序发送
+		seg->frg = (kcp->stream == 0)? (count - i - 1) : 0;     // frg倒序发送  当frg==0时则表示所有分段已收完
 		iqueue_init(&seg->node);
 		iqueue_add_tail(&seg->node, &kcp->snd_queue);
 		kcp->nsnd_que++;
