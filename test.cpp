@@ -85,8 +85,11 @@ void test(int mode)
 	while (1) {
 		isleep(1);
 		current = iclock();
+		ikcp_send(kcp1, buffer, 8);
 		ikcp_update(kcp1, iclock());
-		ikcp_update(kcp2, iclock());
+
+		// ikcp_update(kcp1, iclock());
+		// ikcp_update(kcp2, iclock());
 
 		// 每隔 20ms，kcp1发送数据
 		for (; current >= slap; slap += 20) {

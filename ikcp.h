@@ -135,7 +135,7 @@ typedef unsigned long long IUINT64;
 #define __IQUEUE_DEF__
 
 struct IQUEUEHEAD {
-	struct IQUEUEHEAD *next, *prev;
+	struct IQUEUEHEAD *next, *prev; // next(next由头到尾)  prev(由尾到头, 起点在head中)
 };
 
 typedef struct IQUEUEHEAD iqueue_head;
@@ -262,24 +262,24 @@ typedef struct IQUEUEHEAD iqueue_head;
 
 
 //=====================================================================
-// SEGMENT
+// SEGMENT 内存中管理的传输分段
 //=====================================================================
 struct IKCPSEG
 {
 	struct IQUEUEHEAD node;
 	IUINT32 conv;
 	IUINT32 cmd;
-	IUINT32 frg;
-	IUINT32 wnd;
-	IUINT32 ts;
-	IUINT32 sn;
-	IUINT32 una;
-	IUINT32 len;
-	IUINT32 resendts;
+	IUINT32 frg;                // 一个数据包的第几个分段 (ikcp_send一次发送为一个数据包)
+	IUINT32 wnd;                // 我的剩余接受窗口大小
+	IUINT32 ts;                 // 当前时钟
+	IUINT32 sn;                 // 分段序号
+	IUINT32 una;                // 已收到完整数据中最大分段号
+	IUINT32 len;                // 分段的数据长度 len(data)
+	IUINT32 resendts;           // 再次发送时钟
 	IUINT32 rto;
-	IUINT32 fastack;
-	IUINT32 xmit;
-	char data[1];
+	IUINT32 fastack;            // 后续分段被确认时增加计数，用以快速重传
+	IUINT32 xmit;               // 分段快速重传次数
+	char data[1];               // 数据域首地址
 };
 
 
@@ -288,29 +288,35 @@ struct IKCPSEG
 //---------------------------------------------------------------------
 struct IKCPCB
 {
+    // conv(连接ID，双方通讯身份标示) mtu(网络传输分段最大大小) mss(应用数据分段最大大小 = mtu - kcp固定包头)
 	IUINT32 conv, mtu, mss, state;
+    // snd_una(已发送的、未确认的最小分段序号) snd_nxt(发送分段序号种子,分段的序号由此生成)
+    // rcv_nxt(收到的、连续内容的最大分段序号)
 	IUINT32 snd_una, snd_nxt, rcv_nxt;
+    // ssthresh(慢启动)
 	IUINT32 ts_recent, ts_lastack, ssthresh;
 	IINT32 rx_rttval, rx_srtt, rx_rto, rx_minrto;
+    // snd_wnd发送窗口的大小(分段)  rcv_wnd接受窗口的大小(分段),rcv_queue不会超过该尺寸  rmt_wnd(远端接受窗口大小,每个分段中都会携带)  cwnd(拥塞控制窗口)
 	IUINT32 snd_wnd, rcv_wnd, rmt_wnd, cwnd, probe;
+    // current(当前的时钟 毫秒) interval(控制update时调用ikcp_flush的间隔)  ts_flush(下次ikcp_flush调用时间)
 	IUINT32 current, interval, ts_flush, xmit;
-	IUINT32 nrcv_buf, nsnd_buf;
-	IUINT32 nrcv_que, nsnd_que;
-	IUINT32 nodelay, updated;
+	IUINT32 nrcv_buf, nsnd_buf;         // nrcv_buf(rcv_buf中分段个数) nsnd_buf(snd_buf中分段个数)
+	IUINT32 nrcv_que, nsnd_que;         // nrcv_que(len(rcv_queue))  nsnd_que(len(snd_queue))
+	IUINT32 nodelay, updated;           // nodelay(非0无延迟发送) updated(标示ikcp_update函数是否已被调用过1次)
 	IUINT32 ts_probe, probe_wait;
 	IUINT32 dead_link, incr;
-	struct IQUEUEHEAD snd_queue;
-	struct IQUEUEHEAD rcv_queue;
-	struct IQUEUEHEAD snd_buf;
-	struct IQUEUEHEAD rcv_buf;
-	IUINT32 *acklist;
-	IUINT32 ackcount;
-	IUINT32 ackblock;
+	struct IQUEUEHEAD snd_queue;        // 发送分段队列（空节点，仅保存双向链表的两个指针，next由头向尾，pre由尾向头)
+	struct IQUEUEHEAD rcv_queue;        // 接受队列，连续的数据都会存放在这里
+	struct IQUEUEHEAD snd_buf;          // 发送缓存
+	struct IQUEUEHEAD rcv_buf;          // 接受缓存，从网上接受到的分段存在这里，可能不连续 
+	IUINT32 *acklist;                   // 存放确认信息[i*2 + 0]为收到的分段的序号 [i*2 + 1] 为分段的时钟
+	IUINT32 ackcount;                   // acklist中元素的个数
+	IUINT32 ackblock;                   // acklist容量,同时也控制分配的粒度
 	void *user;
 	char *buffer;
-	int fastresend;
-	int fastlimit;
-	int nocwnd, stream;
+	int fastresend;                     // 非0快速重传
+	int fastlimit;                      // 一个分段快速重传总次数，超过该值了则不再快速重传(而是等超时再重传)   小于等于0则表示无限重传
+	int nocwnd, stream;                 // nocwnd(0表示无拥塞控制)  stream(流模式，无数据包阶段，类似于tcp上层需要处理)
 	int logmask;
 	int (*output)(const char *buf, int len, struct IKCPCB *kcp, void *user);
 	void (*writelog)(const char *log, struct IKCPCB *kcp, void *user);
@@ -356,6 +362,7 @@ void ikcp_setoutput(ikcpcb *kcp, int (*output)(const char *buf, int len,
 int ikcp_recv(ikcpcb *kcp, char *buffer, int len);
 
 // user/upper level send, returns below zero for error
+// 分片并将分段放入发送队列中
 int ikcp_send(ikcpcb *kcp, const char *buffer, int len);
 
 // update state (call it repeatedly, every 10ms-100ms), or you can ask 

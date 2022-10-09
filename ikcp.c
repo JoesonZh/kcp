@@ -24,21 +24,26 @@
 //=====================================================================
 const IUINT32 IKCP_RTO_NDL = 30;		// no delay min rto
 const IUINT32 IKCP_RTO_MIN = 100;		// normal min rto
-const IUINT32 IKCP_RTO_DEF = 200;
+const IUINT32 IKCP_RTO_DEF = 200;       // 默认重传超时时长
 const IUINT32 IKCP_RTO_MAX = 60000;
-const IUINT32 IKCP_CMD_PUSH = 81;		// cmd: push data
-const IUINT32 IKCP_CMD_ACK  = 82;		// cmd: ack
-const IUINT32 IKCP_CMD_WASK = 83;		// cmd: window probe (ask)
+
+// 网络上传输的分段命令
+const IUINT32 IKCP_CMD_PUSH = 81;		// cmd: push data  发送数据
+const IUINT32 IKCP_CMD_ACK  = 82;		// cmd: ack 确认收到
+const IUINT32 IKCP_CMD_WASK = 83;		// cmd: window probe (ask)  通知对方，想获得接收窗口大小
 const IUINT32 IKCP_CMD_WINS = 84;		// cmd: window size (tell)
+
+// 内部使用 probe 用
 const IUINT32 IKCP_ASK_SEND = 1;		// need to send IKCP_CMD_WASK
 const IUINT32 IKCP_ASK_TELL = 2;		// need to send IKCP_CMD_WINS
+
 const IUINT32 IKCP_WND_SND = 32;
 const IUINT32 IKCP_WND_RCV = 128;       // must >= max fragment size
 const IUINT32 IKCP_MTU_DEF = 1400;
 const IUINT32 IKCP_ACK_FAST	= 3;
 const IUINT32 IKCP_INTERVAL	= 100;
 const IUINT32 IKCP_OVERHEAD = 24;
-const IUINT32 IKCP_DEADLINK = 20;
+const IUINT32 IKCP_DEADLINK = 20;           // kcp每个分段报头长度，格式参见protocol.txt
 const IUINT32 IKCP_THRESH_INIT = 2;
 const IUINT32 IKCP_THRESH_MIN = 2;
 const IUINT32 IKCP_PROBE_INIT = 7000;		// 7 secs to probe window size
@@ -260,7 +265,7 @@ ikcpcb* ikcp_create(IUINT32 conv, void *user)
 		return NULL;
 	}
 
-	iqueue_init(&kcp->snd_queue);
+	iqueue_init(&kcp->snd_queue);       // 双向链表 pre&next都初始化为自己
 	iqueue_init(&kcp->rcv_queue);
 	iqueue_init(&kcp->snd_buf);
 	iqueue_init(&kcp->rcv_buf);
@@ -411,6 +416,7 @@ int ikcp_recv(ikcpcb *kcp, char *buffer, int len)
 	assert(len == peeksize);
 
 	// move available data from rcv_buf -> rcv_queue
+    // 在rcv_queue已满的情况下，取出数据后继续将rcv_buf中的分段移到rcv_queue
 	while (! iqueue_is_empty(&kcp->rcv_buf)) {
 		seg = iqueue_entry(kcp->rcv_buf.next, IKCPSEG, node);
 		if (seg->sn == kcp->rcv_nxt && kcp->nrcv_que < kcp->rcv_wnd) {
@@ -451,8 +457,9 @@ int ikcp_peeksize(const ikcpcb *kcp)
 	seg = iqueue_entry(kcp->rcv_queue.next, IKCPSEG, node);
 	if (seg->frg == 0) return seg->len;
 
-	if (kcp->nrcv_que < seg->frg + 1) return -1;
+	if (kcp->nrcv_que < seg->frg + 1) return -1;        // 还未收完所有分段
 
+    // 数据包的长度是各分段总和
 	for (p = kcp->rcv_queue.next; p != &kcp->rcv_queue; p = p->next) {
 		seg = iqueue_entry(p, IKCPSEG, node);
 		length += seg->len;
@@ -474,7 +481,7 @@ int ikcp_send(ikcpcb *kcp, const char *buffer, int len)
 	assert(kcp->mss > 0);
 	if (len < 0) return -1;
 
-	// append to previous segment in streaming mode (if possible)
+    // 流模式，尽量往一个分段中塞尽可能多的数据
 	if (kcp->stream != 0) {
 		if (!iqueue_is_empty(&kcp->snd_queue)) {
 			IKCPSEG *old = iqueue_entry(kcp->snd_queue.prev, IKCPSEG, node);
@@ -505,15 +512,15 @@ int ikcp_send(ikcpcb *kcp, const char *buffer, int len)
 	}
 
 	if (len <= (int)kcp->mss) count = 1;
-	else count = (len + kcp->mss - 1) / kcp->mss;
+	else count = (len + kcp->mss - 1) / kcp->mss;       // 分几个分段发出去
 
 	if (count >= (int)IKCP_WND_RCV) return -2;
 
 	if (count == 0) count = 1;
 
-	// fragment
+	// fragment  做分段
 	for (i = 0; i < count; i++) {
-		int size = len > (int)kcp->mss ? (int)kcp->mss : len;
+		int size = len > (int)kcp->mss ? (int)kcp->mss : len;   // 新分段的数据长度
 		seg = ikcp_segment_new(kcp, size);
 		assert(seg);
 		if (seg == NULL) {
@@ -523,7 +530,7 @@ int ikcp_send(ikcpcb *kcp, const char *buffer, int len)
 			memcpy(seg->data, buffer, size);
 		}
 		seg->len = size;
-		seg->frg = (kcp->stream == 0)? (count - i - 1) : 0;
+		seg->frg = (kcp->stream == 0)? (count - i - 1) : 0;     // frg倒序发送
 		iqueue_init(&seg->node);
 		iqueue_add_tail(&seg->node, &kcp->snd_queue);
 		kcp->nsnd_que++;
@@ -572,7 +579,8 @@ static void ikcp_parse_ack(ikcpcb *kcp, IUINT32 sn)
 {
 	struct IQUEUEHEAD *p, *next;
 
-	if (_itimediff(sn, kcp->snd_una) < 0 || _itimediff(sn, kcp->snd_nxt) >= 0)
+	if (_itimediff(sn, kcp->snd_una) < 0            // 通过una确认了
+        || _itimediff(sn, kcp->snd_nxt) >= 0)       // 还没发送 容错吧
 		return;
 
 	for (p = kcp->snd_buf.next; p != &kcp->snd_buf; p = next) {
@@ -592,6 +600,7 @@ static void ikcp_parse_ack(ikcpcb *kcp, IUINT32 sn)
 
 static void ikcp_parse_una(ikcpcb *kcp, IUINT32 una)
 {
+    // 将发送队列中、序号小于una的分段都删除
 	struct IQUEUEHEAD *p, *next;
 	for (p = kcp->snd_buf.next; p != &kcp->snd_buf; p = next) {
 		IKCPSEG *seg = iqueue_entry(p, IKCPSEG, node);
@@ -606,6 +615,7 @@ static void ikcp_parse_una(ikcpcb *kcp, IUINT32 una)
 	}
 }
 
+// 标记发送缓存中，sn分段前面的、还未收到确认的分段，以使快速重传。有一个背景:已经确认的包会从发送缓存中删除
 static void ikcp_parse_fastack(ikcpcb *kcp, IUINT32 sn, IUINT32 ts)
 {
 	struct IQUEUEHEAD *p, *next;
@@ -632,16 +642,16 @@ static void ikcp_parse_fastack(ikcpcb *kcp, IUINT32 sn, IUINT32 ts)
 
 
 //---------------------------------------------------------------------
-// ack append
+// ack append 放到acklist中去
 //---------------------------------------------------------------------
 static void ikcp_ack_push(ikcpcb *kcp, IUINT32 sn, IUINT32 ts)
 {
-	IUINT32 newsize = kcp->ackcount + 1;
+	size_t newsize = kcp->ackcount + 1;
 	IUINT32 *ptr;
 
 	if (newsize > kcp->ackblock) {
 		IUINT32 *acklist;
-		IUINT32 newblock;
+		size_t newblock;
 
 		for (newblock = 8; newblock < newsize; newblock <<= 1);
 		acklist = (IUINT32*)ikcp_malloc(newblock * sizeof(IUINT32) * 2);
@@ -652,7 +662,7 @@ static void ikcp_ack_push(ikcpcb *kcp, IUINT32 sn, IUINT32 ts)
 		}
 
 		if (kcp->acklist != NULL) {
-			IUINT32 x;
+			size_t x;
 			for (x = 0; x < kcp->ackcount; x++) {
 				acklist[x * 2 + 0] = kcp->acklist[x * 2 + 0];
 				acklist[x * 2 + 1] = kcp->acklist[x * 2 + 1];
@@ -686,12 +696,14 @@ void ikcp_parse_data(ikcpcb *kcp, IKCPSEG *newseg)
 	IUINT32 sn = newseg->sn;
 	int repeat = 0;
 	
+    // 这点判断是不需要的，因为在函数的入口已经判断了
 	if (_itimediff(sn, kcp->rcv_nxt + kcp->rcv_wnd) >= 0 ||
 		_itimediff(sn, kcp->rcv_nxt) < 0) {
 		ikcp_segment_delete(kcp, newseg);
 		return;
 	}
 
+    // 查重 & 查自己该放的位置
 	for (p = kcp->rcv_buf.prev; p != &kcp->rcv_buf; p = prev) {
 		IKCPSEG *seg = iqueue_entry(p, IKCPSEG, node);
 		prev = p->prev;
@@ -786,15 +798,16 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 			return -3;
 
 		kcp->rmt_wnd = wnd;
-		ikcp_parse_una(kcp, una);
-		ikcp_shrink_buf(kcp);
+		ikcp_parse_una(kcp, una);           // 利用una删除发送缓存中的数据
+		ikcp_shrink_buf(kcp);               // 更新kcp.snd_una
 
+        // 确认
 		if (cmd == IKCP_CMD_ACK) {
 			if (_itimediff(kcp->current, ts) >= 0) {
-				ikcp_update_ack(kcp, _itimediff(kcp->current, ts));
+				ikcp_update_ack(kcp, _itimediff(kcp->current, ts));     // TODO
 			}
-			ikcp_parse_ack(kcp, sn);
-			ikcp_shrink_buf(kcp);
+			ikcp_parse_ack(kcp, sn);            // 根据sn将发送缓存中、对方已接受的分段删除
+			ikcp_shrink_buf(kcp);               // 更新kcp.snd_una
 			if (flag == 0) {
 				flag = 1;
 				maxack = sn;
@@ -819,13 +832,15 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 					(long)kcp->rx_rto);
 			}
 		}
+        // 分段是数据包
 		else if (cmd == IKCP_CMD_PUSH) {
 			if (ikcp_canlog(kcp, IKCP_LOG_IN_DATA)) {
 				ikcp_log(kcp, IKCP_LOG_IN_DATA, 
 					"input psh: sn=%lu ts=%lu", (unsigned long)sn, (unsigned long)ts);
 			}
 			if (_itimediff(sn, kcp->rcv_nxt + kcp->rcv_wnd) < 0) {
-				ikcp_ack_push(kcp, sn, ts);
+				ikcp_ack_push(kcp, sn, ts); // 放入确认列表
+                // 比已接受数据大
 				if (_itimediff(sn, kcp->rcv_nxt) >= 0) {
 					seg = ikcp_segment_new(kcp, len);
 					seg->conv = conv;
@@ -841,10 +856,11 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 						memcpy(seg->data, data, len);
 					}
 
-					ikcp_parse_data(kcp, seg);
+					ikcp_parse_data(kcp, seg);      // 将分段放入队列中
 				}
 			}
 		}
+        // 分段是(对方想)获得自己的接收窗口
 		else if (cmd == IKCP_CMD_WASK) {
 			// ready to send back IKCP_CMD_WINS in ikcp_flush
 			// tell remote my window size
@@ -853,8 +869,9 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 				ikcp_log(kcp, IKCP_LOG_IN_PROBE, "input probe");
 			}
 		}
+        // 分段是对方告诉我他的接收窗口
 		else if (cmd == IKCP_CMD_WINS) {
-			// do nothing
+			// 已在 kcp->rmt_wnd = wnd; 赋值了，这里不作任何事情
 			if (ikcp_canlog(kcp, IKCP_LOG_IN_WINS)) {
 				ikcp_log(kcp, IKCP_LOG_IN_WINS,
 					"input wins: %lu", (unsigned long)(wnd));
@@ -868,11 +885,14 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 		size -= len;
 	}
 
-	if (flag != 0) {
-		ikcp_parse_fastack(kcp, maxack, latest_ts);
+    // 这里可以优化：fastresend未启动快速重传则不需要计数
+	if (flag != 0 && kcp->fastresend != 0) {
+		ikcp_parse_fastack(kcp, maxack, latest_ts);         // 打快速重传标记
 	}
 
+    // 发送UNA有更新
 	if (_itimediff(kcp->snd_una, prev_una) > 0) {
+        // 拥塞控制后的慢恢复
 		if (kcp->cwnd < kcp->rmt_wnd) {
 			IUINT32 mss = kcp->mss;
 			if (kcp->cwnd < kcp->ssthresh) {
@@ -932,7 +952,7 @@ void ikcp_flush(ikcpcb *kcp)
 {
 	IUINT32 current = kcp->current;
 	char *buffer = kcp->buffer;
-	char *ptr = buffer;
+	char *ptr = buffer;         // ptr作为后续内存操作的游标
 	int count, size, i;
 	IUINT32 resent, cwnd;
 	IUINT32 rtomin;
@@ -953,7 +973,7 @@ void ikcp_flush(ikcpcb *kcp)
 	seg.sn = 0;
 	seg.ts = 0;
 
-	// flush acknowledges
+	// 发送收到确认
 	count = kcp->ackcount;
 	for (i = 0; i < count; i++) {
 		size = (int)(ptr - buffer);
@@ -965,7 +985,7 @@ void ikcp_flush(ikcpcb *kcp)
 		ptr = ikcp_encode_seg(ptr, &seg);
 	}
 
-	kcp->ackcount = 0;
+	kcp->ackcount = 0;          // 一个思考：如果这个确认包丢失了，那么对方又会重新发？
 
 	// probe window size (if remote window size equals zero)
 	if (kcp->rmt_wnd == 0) {
@@ -989,7 +1009,7 @@ void ikcp_flush(ikcpcb *kcp)
 		kcp->probe_wait = 0;
 	}
 
-	// flush window probing commands
+	// 通知对方我需要知道你的接收窗口
 	if (kcp->probe & IKCP_ASK_SEND) {
 		seg.cmd = IKCP_CMD_WASK;
 		size = (int)(ptr - buffer);
@@ -1000,7 +1020,8 @@ void ikcp_flush(ikcpcb *kcp)
 		ptr = ikcp_encode_seg(ptr, &seg);
 	}
 
-	// flush window probing commands
+	// 通知对方自己的接收窗口 接收到IKCP_CMD_WASK后给probe加IKCP_ASK_TELL标记
+    // 这里可以优化：若会发送分段，则不用单独传递这个分段
 	if (kcp->probe & IKCP_ASK_TELL) {
 		seg.cmd = IKCP_CMD_WINS;
 		size = (int)(ptr - buffer);
@@ -1020,7 +1041,7 @@ void ikcp_flush(ikcpcb *kcp)
 	// move data from snd_queue to snd_buf
 	while (_itimediff(kcp->snd_nxt, kcp->snd_una + cwnd) < 0) {
 		IKCPSEG *newseg;
-		if (iqueue_is_empty(&kcp->snd_queue)) break;
+		if (iqueue_is_empty(&kcp->snd_queue)) break;        // 发送队列中无序列
 
 		newseg = iqueue_entry(kcp->snd_queue.next, IKCPSEG, node);
 
@@ -1043,32 +1064,35 @@ void ikcp_flush(ikcpcb *kcp)
 
 	// calculate resent
 	resent = (kcp->fastresend > 0)? (IUINT32)kcp->fastresend : 0xffffffff;
-	rtomin = (kcp->nodelay == 0)? (kcp->rx_rto >> 3) : 0;
+	rtomin = (kcp->nodelay == 0)? (kcp->rx_rto >> 3) : 0;       // 重传修订
 
 	// flush data segments
 	for (p = kcp->snd_buf.next; p != &kcp->snd_buf; p = p->next) {
 		IKCPSEG *segment = iqueue_entry(p, IKCPSEG, node);
 		int needsend = 0;
+        // 第一次发送
 		if (segment->xmit == 0) {
 			needsend = 1;
 			segment->xmit++;
 			segment->rto = kcp->rx_rto;
 			segment->resendts = current + segment->rto + rtomin;
 		}
+        // 重传
 		else if (_itimediff(current, segment->resendts) >= 0) {
 			needsend = 1;
 			segment->xmit++;
 			kcp->xmit++;
 			if (kcp->nodelay == 0) {
-				segment->rto += _imax_(segment->rto, (IUINT32)kcp->rx_rto);
+				segment->rto += _imax_(segment->rto, (IUINT32)kcp->rx_rto);     // 延迟发送，增加rto
 			}	else {
 				IINT32 step = (kcp->nodelay < 2)? 
 					((IINT32)(segment->rto)) : kcp->rx_rto;
-				segment->rto += step / 2;
+				segment->rto += step / 2;           // 不延迟发送，少量增加rto
 			}
 			segment->resendts = current + segment->rto;
-			lost = 1;
+			lost = 1;       // 出现了丢包，因为超过resendts都没有确认
 		}
+        // 快速重传：后续包被确认次数 超过了 重传计数
 		else if (segment->fastack >= resent) {
 			if ((int)segment->xmit <= kcp->fastlimit || 
 				kcp->fastlimit <= 0) {
@@ -1083,7 +1107,7 @@ void ikcp_flush(ikcpcb *kcp)
 		if (needsend) {
 			int need;
 			segment->ts = current;
-			segment->wnd = seg.wnd;
+			segment->wnd = seg.wnd;     // 附带上自己的接受窗口
 			segment->una = kcp->rcv_nxt;
 
 			size = (int)(ptr - buffer);
